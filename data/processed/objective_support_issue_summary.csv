@@ -1,0 +1,6 @@
+issue_log,stations,pct_stations
+pass,802,0.4768133174791914
+missing_demand_features,407,0.24197384066587396
+very_low_coverage,322,0.19143876337693222
+low_coverage,88,0.052318668252080855
+high_full_occupancy,63,0.03745541022592152

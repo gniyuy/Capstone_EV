@@ -1,0 +1,7 @@
+threshold,stations_flagged,pct_stations_flagged,recommendation,action
+0.01,393,0.2366044551475015,Sensitivity threshold,Use for sensitivity comparison
+0.03,279,0.16797110174593619,Sensitivity threshold,Use for sensitivity comparison
+0.05,231,0.1390728476821192,Recommended main threshold: flag stations above 5% full-occupancy rows,"Keep station, flag high_full_occupancy, exclude these rows from primary utilisation sensitivity if needed"
+0.1,145,0.08729680915111379,Sensitivity threshold,Use for sensitivity comparison
+0.15,108,0.0650210716435882,Sensitivity threshold,Use for sensitivity comparison
+0.2,93,0.055990367248645395,Sensitivity threshold,Use for sensitivity comparison

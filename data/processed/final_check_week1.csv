@@ -1,0 +1,2 @@
+n_rows,n_unique_station_ids,duplicate_station_ids,missing_coordinates,duplicate_coordinate_stations,missing_mean_utilisation,ready_for_kde_n,ready_for_gwr_n
+1682,1682,0,0,264,21,1682,1423

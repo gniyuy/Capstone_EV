@@ -1,0 +1,2 @@
+stations_total,stations_with_coordinates,stations_ready_for_kde,stations_modelling_eligible,stations_low_coverage,stations_high_full_occupancy,mean_primary_valid_pct,median_primary_valid_pct,mean_utilisation_network,median_utilisation_network,objective_1_supported,objective_2_supported,overall_note
+1682,1682,1682,865,817,231,0.525977945808324,0.7388351749539595,0.21687893783926998,0.1829395325203252,TRUE,FALSE,"Objective 1 remains supported, but Objective 2 may be affected by reduced modelling-eligible stations. Consider relaxed coverage thresholds or pooled modelling."

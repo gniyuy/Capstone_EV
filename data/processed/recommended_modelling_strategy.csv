@@ -1,0 +1,6 @@
+dominant_type,stations_total,stations_modelling_eligible,gwr_warning,recommended_strategy
+fast,113,2,TRUE,Do not rely on separate GWR/GWML. Use pooled model with charger-type interaction or descriptive analysis.
+fast_dominant_mixed,9,0,TRUE,No modelling strategy available for this group.
+slow,1506,858,FALSE,Proceed with separate charger-type model if POI covariates are also complete.
+slow_dominant_mixed,33,5,TRUE,Do not rely on separate GWR/GWML. Use pooled model with charger-type interaction or descriptive analysis.
+unknown,21,0,TRUE,No modelling strategy available for this group.

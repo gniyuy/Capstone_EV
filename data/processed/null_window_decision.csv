@@ -1,0 +1,2 @@
+total_rows,null_rows,null_pct,decision,rationale
+87679296,18555366,0.21162768003976673,Exclude all-state-null rows from utilisation aggregation,"All occupancy state fields are missing, so these rows represent missing transmission rather than zero demand."

@@ -1,0 +1,6 @@
+station_type,dominant_type,n,pct
+slow_only,slow,1506,0.8953626634958383
+fast_only,fast,113,0.06718192627824018
+mixed,slow_dominant_mixed,33,0.019619500594530322
+unknown,unknown,21,0.01248513674197384
+mixed,fast_dominant_mixed,9,0.00535077288941736

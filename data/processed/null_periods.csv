@@ -1,0 +1,2 @@
+break_id,start_time,end_time,n_intervals,duration_hours,duration_days,mean_null_pct,min_null_pct,max_null_pct
+1,2022-10-27T16:35:00Z,2022-10-27T17:00:00Z,6,0.5,0.020833333333333332,0.9958382877526754,0.9958382877526754,0.9958382877526754

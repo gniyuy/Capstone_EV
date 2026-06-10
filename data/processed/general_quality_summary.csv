@@ -1,0 +1,9 @@
+issue,rows
+rows,87679296
+negative_state_rows,0
+invalid_utilisation_rows,0
+pile_total_mismatch_rows,0
+price_invalid_rows,21067337
+duration_invalid_rows,0
+volume_invalid_rows,0
+all_state_null_rows,18555366

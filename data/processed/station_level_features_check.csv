@@ -1,0 +1,2 @@
+stations_total,unique_station_ids,duplicate_station_ids,stations_modelling_eligible,stations_low_coverage,missing_coordinates,missing_mean_utilisation,mean_util_network,median_util_network,min_primary_valid_pct,median_primary_valid_pct,max_primary_valid_pct
+1682,1682,0,865,817,0,407,0.21687893783926998,0.18293953252032522,0,0.7388351749539595,0.9998848987108656
