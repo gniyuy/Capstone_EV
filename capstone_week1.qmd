@@ -1,0 +1,3018 @@
+---
+title: "EV Charging Demand in Shenzhen"
+format: html
+editor: visual
+---
+
+## Week 1 Data Wrangling Deliverable
+
+### **Week 1 Goal**
+
+- Build one station-level table (1,682 rows, one per station) joining utilisation, charger type, pricing, and POI counts
+- Aggregate the \~84M occupancy rows up to station level — decide and document the time window and the demand measure (e.g. mean/peak occupancy)
+- Flag and log data issues per station (missing intervals, zero-variance series, duplicate coordinates) in a column, not dropped silently
+- Done = table passes basic checks (row count, no duplicate station IDs, coordinates inside Shenzhen) and is saved as the single input for the KDE/NCKDE and GWR/GWML steps
+
+### 1. Load and assemble the 1,682 station CSVs
+
+#### Issue and rule
+
+Each station has a separate 5-minute CSV file. The rule is to load all station files into one long-format table, attach `station_id` from the file name, standardise column types, then join station metadata from `station_information.csv`.
+
+```{r}
+# 01_load_station_files.R
+
+library(tidyverse)
+library(fs)
+library(janitor)
+library(DBI)
+library(duckdb)
+library(glue)
+
+# -----------------------------
+# Paths
+# -----------------------------
+
+raw_dir <- "raw/20220901-20230228_station-raw"
+station_dir <- file.path(raw_dir, "charge_5min")
+
+dir_create("data/processed")
+
+station_files <- dir_ls(station_dir, glob = "*.csv")
+length(station_files)
+# Expected: 1682
+
+
+# -----------------------------
+# Load station metadata
+# -----------------------------
+
+station_meta <- read_csv(
+  file.path(raw_dir, "station_information.csv"),
+  show_col_types = FALSE
+) |>
+  clean_names() |>
+  mutate(station_id = as.integer(station_id))
+
+
+# -----------------------------
+# DuckDB connection
+# -----------------------------
+
+con <- dbConnect(
+  duckdb(),
+  dbdir = "data/processed/urbanev.duckdb"
+)
+
+station_glob <- normalizePath(
+  file.path(station_dir, "*.csv"),
+  mustWork = FALSE
+)
+
+station_glob_sql <- gsub("\\\\", "/", station_glob)
+
+
+# -----------------------------
+# Read all CSVs as text
+# -----------------------------
+
+dbExecute(con, glue("
+CREATE OR REPLACE VIEW station_raw AS
+SELECT *
+FROM read_csv(
+  '{station_glob_sql}',
+  filename = true,
+  union_by_name = true,
+  all_varchar = true,
+  header = true,
+  ignore_errors = true
+);
+"))
+
+
+# -----------------------------
+# Parse and cast safely
+# -----------------------------
+
+dbExecute(con, "
+CREATE OR REPLACE VIEW station_parsed AS
+SELECT
+  regexp_extract(filename, '([0-9]+)\\.csv$', 1)::INTEGER AS station_id,
+
+  NULLIF(TRIM(time), '') AS time_raw,
+
+  COALESCE(
+    try_strptime(NULLIF(TRIM(time), ''), '%d/%m/%Y %H:%M'),
+    try_strptime(NULLIF(TRIM(time), ''), '%d/%m/%Y %H:%M:%S'),
+    try_strptime(NULLIF(TRIM(time), ''), '%Y-%m-%d %H:%M:%S'),
+    try_strptime(NULLIF(TRIM(time), ''), '%Y-%m-%d %H:%M'),
+    try_strptime(NULLIF(TRIM(time), ''), '%Y/%m/%d %H:%M:%S'),
+    try_strptime(NULLIF(TRIM(time), ''), '%Y/%m/%d %H:%M')
+  ) AS time_parsed,
+
+  try_cast(NULLIF(TRIM(busy), '') AS DOUBLE) AS busy,
+  try_cast(NULLIF(TRIM(idle), '') AS DOUBLE) AS idle,
+  try_cast(NULLIF(TRIM(s_price), '') AS DOUBLE) AS s_price,
+  try_cast(NULLIF(TRIM(e_price), '') AS DOUBLE) AS e_price,
+  try_cast(NULLIF(TRIM(fast_busy), '') AS DOUBLE) AS fast_busy,
+  try_cast(NULLIF(TRIM(fast_idle), '') AS DOUBLE) AS fast_idle,
+  try_cast(NULLIF(TRIM(slow_busy), '') AS DOUBLE) AS slow_busy,
+  try_cast(NULLIF(TRIM(slow_idle), '') AS DOUBLE) AS slow_idle,
+  try_cast(NULLIF(TRIM(duration), '') AS DOUBLE) AS duration,
+  try_cast(NULLIF(TRIM(volume), '') AS DOUBLE) AS volume
+
+FROM station_raw;
+")
+
+
+# -----------------------------
+# Basic raw data check
+# -----------------------------
+
+raw_check <- dbGetQuery(con, "
+SELECT
+  COUNT(*) AS n_rows,
+  COUNT(DISTINCT station_id) AS n_stations,
+  MIN(time_parsed) AS min_time_parsed,
+  MAX(time_parsed) AS max_time_parsed,
+  SUM(CASE WHEN time_parsed IS NULL THEN 1 ELSE 0 END) AS failed_time_rows
+FROM station_parsed;
+")
+
+raw_check
+
+write_csv(raw_check, "data/processed/raw_check_week1.csv")
+
+
+# -----------------------------
+# Timestamp issue log
+# -----------------------------
+
+timestamp_issue_log <- dbGetQuery(con, "
+SELECT
+  station_id,
+  time_raw,
+  COUNT(*) AS failed_rows
+FROM station_parsed
+WHERE time_parsed IS NULL
+  AND time_raw IS NOT NULL
+GROUP BY station_id, time_raw
+ORDER BY station_id, time_raw;
+")
+
+write_csv(
+  timestamp_issue_log,
+  "data/processed/timestamp_issue_log.csv"
+)
+
+
+# -----------------------------
+# Row count by station
+# -----------------------------
+
+row_count_by_station <- dbGetQuery(con, "
+SELECT
+  station_id,
+  COUNT(*) AS n_rows
+FROM station_parsed
+GROUP BY station_id
+ORDER BY station_id;
+")
+
+row_count_check <- row_count_by_station |>
+  summarise(
+    min_rows = min(n_rows),
+    median_rows = median(n_rows),
+    max_rows = max(n_rows),
+    stations_with_short_files = sum(n_rows < median(n_rows) * 0.9)
+  )
+
+row_count_check
+
+write_csv(row_count_by_station, "data/processed/row_count_by_station.csv")
+write_csv(row_count_check, "data/processed/row_count_check_week1.csv")
+
+
+# -----------------------------
+# Null window check
+# -----------------------------
+
+null_by_time <- dbGetQuery(con, "
+WITH flagged AS (
+  SELECT
+    time_parsed,
+    station_id,
+    CASE
+      WHEN busy IS NULL
+       AND idle IS NULL
+       AND fast_busy IS NULL
+       AND fast_idle IS NULL
+       AND slow_busy IS NULL
+       AND slow_idle IS NULL
+      THEN 1 ELSE 0
+    END AS all_state_null
+  FROM station_parsed
+)
+
+SELECT
+  time_parsed,
+  COUNT(DISTINCT station_id) AS stations_seen,
+  SUM(all_state_null) AS null_stations,
+  SUM(all_state_null) * 1.0 / COUNT(DISTINCT station_id) AS null_station_share
+FROM flagged
+WHERE time_parsed IS NOT NULL
+GROUP BY time_parsed
+ORDER BY time_parsed;
+")
+  
+  write_csv(null_by_time, "data/processed/null_by_time.csv")
+  
+  
+  # -----------------------------
+  # Station-level quality checks
+  # -----------------------------
+  
+  station_quality <- dbGetQuery(con, "
+WITH flagged AS (
+  SELECT
+    *,
+    CASE
+      WHEN busy IS NULL
+       AND idle IS NULL
+       AND fast_busy IS NULL
+       AND fast_idle IS NULL
+       AND slow_busy IS NULL
+       AND slow_idle IS NULL
+      THEN 1 ELSE 0
+    END AS all_state_null,
+
+    CASE
+      WHEN busy + idle > 0
+      THEN busy * 1.0 / (busy + idle)
+      ELSE NULL
+    END AS utilisation
+  FROM station_parsed
+)
+
+SELECT
+  station_id,
+  COUNT(*) AS n_rows,
+
+  SUM(CASE WHEN time_parsed IS NULL THEN 1 ELSE 0 END)
+    AS failed_time_rows,
+
+  SUM(all_state_null)
+    AS all_state_null_rows,
+
+  SUM(all_state_null) * 1.0 / COUNT(*)
+    AS all_state_null_pct,
+
+  SUM(CASE WHEN utilisation IS NULL THEN 1 ELSE 0 END)
+    AS missing_utilisation_rows,
+
+  SUM(CASE WHEN utilisation < 0 OR utilisation > 1 THEN 1 ELSE 0 END)
+    AS invalid_utilisation_rows,
+
+  SUM(CASE WHEN busy < 0 OR idle < 0 THEN 1 ELSE 0 END)
+    AS negative_state_rows,
+
+  SUM(CASE WHEN s_price < 0 OR e_price < 0 OR e_price < s_price THEN 1 ELSE 0 END)
+    AS invalid_price_rows,
+
+  SUM(CASE WHEN duration < 0 THEN 1 ELSE 0 END)
+    AS invalid_duration_rows,
+
+  SUM(CASE WHEN volume < 0 THEN 1 ELSE 0 END)
+    AS invalid_volume_rows,
+
+  SUM(CASE WHEN busy = busy + idle AND idle = 0 THEN 1 ELSE 0 END)
+    AS full_occupancy_rows,
+
+  COUNT(*) - COUNT(DISTINCT time_parsed)
+    AS duplicate_time_rows,
+
+  STDDEV(utilisation)
+    AS utilisation_sd_raw
+
+FROM flagged
+GROUP BY station_id
+ORDER BY station_id;
+")
+  
+  station_quality <- station_quality |>
+    mutate(
+      full_occupancy_pct = full_occupancy_rows / n_rows,
+      zero_variance_flag = utilisation_sd_raw == 0,
+      data_quality_flag = case_when(
+        failed_time_rows > 0 ~ "timestamp_issue",
+        all_state_null_pct > 0.30 ~ "high_missing",
+        full_occupancy_pct > 0.05 ~ "high_full_occupancy",
+        zero_variance_flag ~ "zero_variance",
+        duplicate_time_rows > 0 ~ "duplicate_timestamps",
+        invalid_utilisation_rows > 0 ~ "invalid_utilisation",
+        TRUE ~ "pass"
+      )
+    )
+  
+  write_csv(station_quality, "data/processed/station_quality_log.csv")
+  
+  
+  # -----------------------------
+  # Aggregate to station level
+  # -----------------------------
+  
+  station_features <- dbGetQuery(con, "
+WITH cleaned AS (
+  SELECT
+    *,
+    CASE
+      WHEN busy IS NULL
+       AND idle IS NULL
+       AND fast_busy IS NULL
+       AND fast_idle IS NULL
+       AND slow_busy IS NULL
+       AND slow_idle IS NULL
+      THEN 1 ELSE 0
+    END AS all_state_null,
+
+    CASE
+      WHEN busy + idle > 0
+      THEN busy * 1.0 / (busy + idle)
+      ELSE NULL
+    END AS utilisation,
+
+    EXTRACT('hour' FROM time_parsed) AS hour_num,
+    EXTRACT('dow' FROM time_parsed) AS dow_num
+  FROM station_parsed
+),
+
+valid AS (
+  SELECT *
+  FROM cleaned
+  WHERE all_state_null = 0
+    AND utilisation BETWEEN 0 AND 1
+    AND time_parsed IS NOT NULL
+)
+
+SELECT
+  station_id,
+  COUNT(*) AS valid_rows,
+
+  AVG(utilisation) AS mean_utilisation,
+  MEDIAN(utilisation) AS median_utilisation,
+  QUANTILE_CONT(utilisation, 0.95) AS peak_utilisation_p95,
+  MAX(utilisation) AS max_utilisation,
+  STDDEV(utilisation) AS utilisation_sd,
+
+  AVG(CASE WHEN hour_num BETWEEN 9 AND 16 THEN utilisation ELSE NULL END)
+    AS daytime_mean_utilisation,
+
+  AVG(CASE WHEN hour_num >= 22 OR hour_num <= 5 THEN utilisation ELSE NULL END)
+    AS overnight_mean_utilisation,
+
+  AVG(CASE WHEN dow_num IN (0, 6) THEN utilisation ELSE NULL END)
+    AS weekend_mean_utilisation,
+
+  AVG(CASE WHEN dow_num NOT IN (0, 6) THEN utilisation ELSE NULL END)
+    AS weekday_mean_utilisation,
+
+  AVG(duration) AS mean_duration,
+  MEDIAN(duration) AS median_duration,
+
+  AVG(volume) AS mean_volume,
+  SUM(volume) AS total_volume,
+
+  AVG(s_price) AS mean_s_price,
+  AVG(e_price) AS mean_e_price,
+  MEDIAN(s_price) AS median_s_price,
+  MEDIAN(e_price) AS median_e_price,
+  STDDEV(e_price) AS price_sd,
+
+  MAX(fast_busy + fast_idle) AS fast_activity,
+  MAX(slow_busy + slow_idle) AS slow_activity
+
+FROM valid
+GROUP BY station_id
+ORDER BY station_id;
+")
+  
+  station_features <- station_features |>
+    mutate(
+      overnight_minus_daytime =
+        overnight_mean_utilisation - daytime_mean_utilisation,
+      
+      weekend_minus_weekday =
+        weekend_mean_utilisation - weekday_mean_utilisation,
+      
+      charger_type = case_when(
+        fast_activity > 0 & slow_activity == 0 ~ "fast",
+        fast_activity == 0 & slow_activity > 0 ~ "slow",
+        fast_activity > 0 & slow_activity > 0 ~ "mixed",
+        TRUE ~ "unknown"
+      ),
+      
+      dominant_type = case_when(
+        charger_type == "fast" ~ "fast",
+        charger_type == "slow" ~ "slow",
+        charger_type == "mixed" & fast_activity >= slow_activity ~ "fast_dominant_mixed",
+        charger_type == "mixed" & slow_activity > fast_activity ~ "slow_dominant_mixed",
+        TRUE ~ "unknown"
+      )
+    )
+  
+  
+  # -----------------------------
+  # Duplicate coordinate check
+  # -----------------------------
+  
+  coord_quality <- station_meta |>
+    group_by(longitude, latitude) |>
+    mutate(
+      duplicate_coordinate_n = n(),
+      duplicate_coordinate_flag = n() > 1
+    ) |>
+    ungroup() |>
+    select(
+      station_id,
+      duplicate_coordinate_n,
+      duplicate_coordinate_flag
+    )
+  
+  
+  # -----------------------------
+  # Join metadata, demand features, and quality flags
+  # -----------------------------
+  
+  station_level_table <- station_meta |>
+    left_join(station_features, by = "station_id") |>
+    left_join(station_quality, by = "station_id") |>
+    left_join(coord_quality, by = "station_id") |>
+    mutate(
+      ready_for_kde = !is.na(longitude) & !is.na(latitude),
+      
+      ready_for_gwr = ready_for_kde &
+        !is.na(mean_utilisation) &
+        data_quality_flag %in% c(
+          "pass",
+          "high_full_occupancy",
+          "duplicate_timestamps"
+        ),
+      
+      issue_log = case_when(
+        is.na(longitude) | is.na(latitude) ~ "missing_coordinates",
+        duplicate_coordinate_flag ~ "duplicate_coordinate",
+        data_quality_flag != "pass" ~ data_quality_flag,
+        TRUE ~ "pass"
+      )
+    )
+  
+  
+  # -----------------------------
+  # Final checks
+  # -----------------------------
+  
+  final_check <- station_level_table |>
+    summarise(
+      n_rows = n(),
+      n_unique_station_ids = n_distinct(station_id),
+      duplicate_station_ids = n() - n_distinct(station_id),
+      missing_coordinates = sum(is.na(longitude) | is.na(latitude)),
+      duplicate_coordinate_stations = sum(duplicate_coordinate_flag, na.rm = TRUE),
+      missing_mean_utilisation = sum(is.na(mean_utilisation)),
+      ready_for_kde_n = sum(ready_for_kde, na.rm = TRUE),
+      ready_for_gwr_n = sum(ready_for_gwr, na.rm = TRUE)
+    )
+  
+  final_check
+  
+  stopifnot(nrow(station_level_table) == 1682)
+  stopifnot(n_distinct(station_level_table$station_id) == 1682)
+  
+  
+  # -----------------------------
+  # Save outputs
+  # -----------------------------
+  
+  write_csv(station_level_table, "data/processed/station_level_table_week1.csv")
+  write_rds(station_level_table, "data/processed/station_level_table_week1.rds")
+  write_csv(final_check, "data/processed/final_check_week1.csv")
+  
+  dbDisconnect(con, shutdown = TRUE)
+```
+
+#### Rationale
+
+This step confirms that the raw station files have been loaded consistently and that the station count matches the expected network size. The metadata join is essential because Objective 1 needs coordinates, while Objective 2 needs station-level explanatory and response variables.
+
+#### Decision and caveat
+
+Keep the long-format table as the master analytical base. Do not aggregate yet. Any station with missing coordinates should be excluded from spatial modelling but retained in the quality report.
+
+### 2. Verify and handle the null window
+
+#### Issue and rule
+
+A null window occurs when all occupancy-related fields are missing at the same timestamp. The rule is to identify rows where all charger state columns are missing, calculate the network-wide percentage, and test whether the missingness is concentrated in one contiguous period or scattered.
+
+```{r}
+# 02_null_window_check.R
+
+dir_create("data/processed")
+dir_create("outputs/figures")
+
+con <- dbConnect(
+  duckdb(),
+  dbdir = "data/processed/urbanev.duckdb",
+  read_only = FALSE
+)
+
+# -----------------------------
+# 1. Overall null summary
+# -----------------------------
+
+null_summary <- dbGetQuery(con, "
+WITH flagged AS (
+  SELECT
+    station_id,
+    time_parsed,
+    CASE
+      WHEN busy IS NULL
+       AND idle IS NULL
+       AND fast_busy IS NULL
+       AND fast_idle IS NULL
+       AND slow_busy IS NULL
+       AND slow_idle IS NULL
+      THEN 1 ELSE 0
+    END AS all_state_null
+  FROM station_parsed
+)
+
+SELECT
+  COUNT(*) AS total_rows,
+  SUM(all_state_null) AS null_rows,
+  SUM(all_state_null) * 1.0 / COUNT(*) AS null_pct
+FROM flagged;
+")
+  
+  null_summary
+  
+  write_csv(
+    null_summary,
+    "data/processed/null_summary.csv"
+  )
+  
+  
+  # -----------------------------
+  # 2. Time-level concentration
+  # -----------------------------
+  
+  null_by_time <- dbGetQuery(con, "
+WITH flagged AS (
+  SELECT
+    station_id,
+    time_parsed,
+    CASE
+      WHEN busy IS NULL
+       AND idle IS NULL
+       AND fast_busy IS NULL
+       AND fast_idle IS NULL
+       AND slow_busy IS NULL
+       AND slow_idle IS NULL
+      THEN 1 ELSE 0
+    END AS all_state_null
+  FROM station_parsed
+  WHERE time_parsed IS NOT NULL
+)
+
+SELECT
+  time_parsed,
+  COUNT(DISTINCT station_id) AS n_stations,
+  SUM(all_state_null) AS null_stations,
+  SUM(all_state_null) * 1.0 / COUNT(DISTINCT station_id) AS null_station_pct
+FROM flagged
+GROUP BY time_parsed
+ORDER BY time_parsed;
+")
+  
+  write_csv(
+    null_by_time,
+    "data/processed/null_by_time.csv"
+  )
+  
+  p_null_time <- ggplot(null_by_time, aes(time_parsed, null_station_pct)) +
+    geom_line() +
+    labs(
+      title = "Network-wide null state percentage by timestamp",
+      x = "Time",
+      y = "Share of stations with all state fields null"
+    )
+  
+  p_null_time
+  
+  ggsave(
+    "outputs/figures/null_window_by_time.png",
+    p_null_time,
+    width = 10,
+    height = 5,
+    dpi = 300
+  )
+  
+  
+  # -----------------------------
+  # 3. Identify contiguous null periods
+  # -----------------------------
+  
+  null_periods <- null_by_time |>
+    arrange(time_parsed) |>
+    mutate(
+      is_network_null = null_station_pct > 0.95,
+      break_id = cumsum(
+        is_network_null != lag(
+          is_network_null,
+          default = first(is_network_null)
+        )
+      )
+    ) |>
+    filter(is_network_null) |>
+    group_by(break_id) |>
+    summarise(
+      start_time = min(time_parsed),
+      end_time = max(time_parsed),
+      n_intervals = n(),
+      duration_hours = n_intervals * 5 / 60,
+      duration_days = duration_hours / 24,
+      mean_null_pct = mean(null_station_pct),
+      min_null_pct = min(null_station_pct),
+      max_null_pct = max(null_station_pct),
+      .groups = "drop"
+    )
+  
+  null_periods
+  
+  write_csv(
+    null_periods,
+    "data/processed/null_periods.csv"
+  )
+  
+  
+  # -----------------------------
+  # 4. Station-level exposure
+  # -----------------------------
+  
+  null_by_station <- dbGetQuery(con, "
+WITH flagged AS (
+  SELECT
+    station_id,
+    CASE
+      WHEN busy IS NULL
+       AND idle IS NULL
+       AND fast_busy IS NULL
+       AND fast_idle IS NULL
+       AND slow_busy IS NULL
+       AND slow_idle IS NULL
+      THEN 1 ELSE 0
+    END AS all_state_null
+  FROM station_parsed
+)
+
+SELECT
+  station_id,
+  COUNT(*) AS rows,
+  SUM(all_state_null) AS null_rows,
+  SUM(all_state_null) * 1.0 / COUNT(*) AS null_pct
+FROM flagged
+GROUP BY station_id
+ORDER BY station_id;
+")
+  
+  summary(null_by_station$null_pct)
+  
+  write_csv(
+    null_by_station,
+    "data/processed/null_by_station.csv"
+  )
+  
+  p_null_station <- ggplot(null_by_station, aes(null_pct)) +
+    geom_histogram(bins = 40) +
+    labs(
+      title = "Station-level exposure to all-state-null rows",
+      x = "Null row share",
+      y = "Number of stations"
+    )
+  
+  p_null_station
+  
+  ggsave(
+    "outputs/figures/null_share_by_station.png",
+    p_null_station,
+    width = 8,
+    height = 5,
+    dpi = 300
+  )
+  
+  
+  # -----------------------------
+  # 5. Decision table
+  # -----------------------------
+  
+  null_decision <- null_summary |>
+    mutate(
+      decision = case_when(
+        null_pct >= 0.15 ~ "Exclude all-state-null rows from utilisation aggregation",
+        null_pct < 0.15 ~ "Keep rows flagged, but exclude from utilisation calculation",
+        TRUE ~ "Review manually"
+      ),
+      rationale = "All occupancy state fields are missing, so these rows represent missing transmission rather than zero demand."
+    )
+  
+  null_decision
+  
+  write_csv(
+    null_decision,
+    "data/processed/null_window_decision.csv"
+  )
+  
+  dbDisconnect(con, shutdown = TRUE)
+```
+
+#### Rationale
+
+If the null rows appear at the same timestamps across nearly all stations, this is likely a system outage or data extraction gap, not real charging behaviour. Treating these rows as zero utilisation would falsely depress demand and bias both station-level averages and temporal features.
+
+#### Decision and caveat
+
+A total of 18.56 million observations (21.16% of all records) contained simultaneous missing values across all charger occupancy fields. These rows were interpreted as a system-wide data transmission gap rather than genuine zero-demand periods because the missingness occurred concurrently across the charging network. Consequently, the affected rows were excluded from utilisation, session, and temporal feature calculations. However, station-level exposure to the missing period (`null_pct`) was retained as a data quality indicator to ensure transparency and reproducibility.
+
+### **3. Test and handle the full-occupancy anomaly**
+
+#### Issue and rule
+
+A full-occupancy anomaly occurs when the station is recorded as fully occupied for unusually long periods, especially where busy == charge_count and idle == 0. The rule is to flag these rows, calculate each station’s full-occupancy rate, and apply a threshold only after checking the distribution.
+
+```{r}
+# 03_full_occupancy_check.R
+
+library(tidyverse)
+library(DBI)
+library(duckdb)
+library(fs)
+
+dir_create("data/processed")
+dir_create("outputs/figures")
+
+con <- dbConnect(
+  duckdb(),
+  dbdir = "data/processed/urbanev.duckdb",
+  read_only = FALSE
+)
+
+# -----------------------------
+# 1. Full-occupancy by station
+# -----------------------------
+# Rule:
+# Exclude all-state-null rows first.
+# Then flag rows where busy == busy + idle and idle == 0.
+#
+# Note:
+# We use total_recorded_piles = busy + idle instead of charge_count here
+# because station metadata is not inside DuckDB yet.
+# Later we compare with charge_count after joining metadata in R.
+
+full_occ_by_station <- dbGetQuery(con, "
+WITH valid_rows AS (
+  SELECT
+    station_id,
+    time_parsed,
+    busy,
+    idle,
+    fast_busy,
+    fast_idle,
+    slow_busy,
+    slow_idle,
+
+    busy + idle AS total_recorded_piles,
+
+    CASE
+      WHEN busy + idle > 0
+      THEN busy * 1.0 / (busy + idle)
+      ELSE NULL
+    END AS utilisation,
+
+    CASE
+      WHEN busy IS NULL
+       AND idle IS NULL
+       AND fast_busy IS NULL
+       AND fast_idle IS NULL
+       AND slow_busy IS NULL
+       AND slow_idle IS NULL
+      THEN 1 ELSE 0
+    END AS all_state_null
+
+  FROM station_parsed
+),
+
+flagged AS (
+  SELECT
+    *,
+    CASE
+      WHEN all_state_null = 0
+       AND total_recorded_piles > 0
+       AND busy = total_recorded_piles
+       AND idle = 0
+      THEN 1 ELSE 0
+    END AS full_occupancy_row
+  FROM valid_rows
+  WHERE all_state_null = 0
+    AND time_parsed IS NOT NULL
+)
+
+SELECT
+  station_id,
+  COUNT(*) AS valid_rows,
+  SUM(full_occupancy_row) AS full_occ_rows,
+  SUM(full_occupancy_row) * 1.0 / COUNT(*) AS full_occ_pct,
+  AVG(utilisation) AS mean_util_raw,
+  MAX(total_recorded_piles) AS max_recorded_piles,
+  MIN(total_recorded_piles) AS min_recorded_piles
+FROM flagged
+GROUP BY station_id
+ORDER BY station_id;
+")
+  
+  summary(full_occ_by_station$full_occ_pct)
+  
+  write_csv(
+    full_occ_by_station,
+    "data/processed/full_occ_by_station.csv"
+  )
+  
+  
+  # -----------------------------
+  # 2. Join metadata for charge_count check
+  # -----------------------------
+  
+  raw_dir <- "raw/20220901-20230228_station-raw"
+  
+  station_meta <- read_csv(
+    file.path(raw_dir, "station_information.csv"),
+    show_col_types = FALSE
+  ) |>
+    janitor::clean_names() |>
+    mutate(station_id = as.integer(station_id))
+  
+  full_occ_by_station_meta <- full_occ_by_station |>
+    left_join(
+      station_meta |> select(station_id, charge_count),
+      by = "station_id"
+    ) |>
+    mutate(
+      pile_count_mismatch_flag =
+        !is.na(charge_count) &
+        !is.na(max_recorded_piles) &
+        max_recorded_piles != charge_count
+    )
+  
+  write_csv(
+    full_occ_by_station_meta,
+    "data/processed/full_occ_by_station_with_meta.csv"
+  )
+  
+  
+  # -----------------------------
+  # 3. Histogram of full-occupancy share
+  # -----------------------------
+  
+  p_full_occ <- ggplot(full_occ_by_station, aes(full_occ_pct)) +
+    geom_histogram(bins = 60) +
+    labs(
+      title = "Distribution of full-occupancy row share by station",
+      x = "Share of valid rows at full occupancy",
+      y = "Number of stations"
+    )
+  
+  p_full_occ
+  
+  ggsave(
+    "outputs/figures/full_occupancy_share_by_station.png",
+    p_full_occ,
+    width = 8,
+    height = 5,
+    dpi = 300
+  )
+  
+  
+  # -----------------------------
+  # 4. Top 30 stations by full occupancy
+  # -----------------------------
+  
+  top_full_occ_stations <- full_occ_by_station_meta |>
+    arrange(desc(full_occ_pct)) |>
+    slice_head(n = 30)
+  
+  top_full_occ_stations
+  
+  write_csv(
+    top_full_occ_stations,
+    "data/processed/top_30_full_occupancy_stations.csv"
+  )
+  
+  
+  # -----------------------------
+  # 5. Threshold sensitivity
+  # -----------------------------
+  
+  threshold_sensitivity <- tibble(
+    threshold = c(0.01, 0.03, 0.05, 0.10, 0.15, 0.20)
+  ) |>
+    mutate(
+      stations_flagged = map_int(
+        threshold,
+        ~ sum(full_occ_by_station$full_occ_pct > .x, na.rm = TRUE)
+      ),
+      pct_stations_flagged =
+        stations_flagged / nrow(full_occ_by_station)
+    )
+  
+  threshold_sensitivity
+  
+  write_csv(
+    threshold_sensitivity,
+    "data/processed/full_occ_threshold_sensitivity.csv"
+  )
+  
+  
+  # -----------------------------
+  # 6. Check whether full occupancy is clustered in time
+  # -----------------------------
+  
+  full_occ_by_time <- dbGetQuery(con, "
+WITH valid_rows AS (
+  SELECT
+    station_id,
+    time_parsed,
+    busy,
+    idle,
+    fast_busy,
+    fast_idle,
+    slow_busy,
+    slow_idle,
+
+    busy + idle AS total_recorded_piles,
+
+    CASE
+      WHEN busy IS NULL
+       AND idle IS NULL
+       AND fast_busy IS NULL
+       AND fast_idle IS NULL
+       AND slow_busy IS NULL
+       AND slow_idle IS NULL
+      THEN 1 ELSE 0
+    END AS all_state_null
+
+  FROM station_parsed
+),
+
+flagged AS (
+  SELECT
+    *,
+    CASE
+      WHEN all_state_null = 0
+       AND total_recorded_piles > 0
+       AND busy = total_recorded_piles
+       AND idle = 0
+      THEN 1 ELSE 0
+    END AS full_occupancy_row
+  FROM valid_rows
+  WHERE all_state_null = 0
+    AND time_parsed IS NOT NULL
+)
+
+SELECT
+  time_parsed,
+  COUNT(DISTINCT station_id) AS n_stations,
+  SUM(full_occupancy_row) AS full_occ_stations,
+  SUM(full_occupancy_row) * 1.0 / COUNT(DISTINCT station_id) AS full_occ_station_share
+FROM flagged
+GROUP BY time_parsed
+ORDER BY time_parsed;
+")
+  
+  write_csv(
+    full_occ_by_time,
+    "data/processed/full_occ_by_time.csv"
+  )
+  
+  p_full_occ_time <- ggplot(full_occ_by_time, aes(time_parsed, full_occ_station_share)) +
+    geom_line() +
+    labs(
+      title = "Network-wide full-occupancy share by timestamp",
+      x = "Time",
+      y = "Share of stations at full occupancy"
+    )
+  
+  p_full_occ_time
+  
+  ggsave(
+    "outputs/figures/full_occupancy_share_by_time.png",
+    p_full_occ_time,
+    width = 10,
+    height = 5,
+    dpi = 300
+  )
+  
+  # -----------------------------
+  # 7. Recommended decision table
+  # -----------------------------
+  
+  full_occ_decision <- threshold_sensitivity |>
+    mutate(
+      recommendation = case_when(
+        threshold == 0.05 ~
+          "Recommended main threshold: flag stations above 5% full-occupancy rows",
+        TRUE ~
+          "Sensitivity threshold"
+      ),
+      action = case_when(
+        threshold == 0.05 ~
+          "Keep station, flag high_full_occupancy, exclude these rows from primary utilisation sensitivity if needed",
+        TRUE ~
+          "Use for sensitivity comparison"
+      )
+    )
+  
+  full_occ_decision
+  
+  write_csv(
+    full_occ_decision,
+    "data/processed/full_occ_decision.csv"
+  )
+  
+  
+  dbDisconnect(con, shutdown = TRUE)
+```
+
+```{r}
+# 03_heatmap_zone_hour.R
+
+library(tidyverse)
+library(DBI)
+library(duckdb)
+library(fs)
+library(janitor)
+
+dir_create("data/processed")
+dir_create("outputs/figures")
+
+raw_dir <- "raw/20220901-20230228_station-raw"
+
+con <- dbConnect(
+  duckdb(),
+  dbdir = "data/processed/urbanev.duckdb",
+  read_only = FALSE
+)
+
+# -----------------------------
+# Load metadata for TAZID
+# -----------------------------
+
+station_meta <- read_csv(
+  file.path(raw_dir, "station_information.csv"),
+  show_col_types = FALSE
+) |>
+  clean_names() |>
+  mutate(station_id = as.integer(station_id))
+
+dbWriteTable(
+  con,
+  "station_meta",
+  station_meta,
+  overwrite = TRUE
+)
+
+# -----------------------------
+# Zone-hour utilisation table
+# -----------------------------
+
+zone_hour_util <- dbGetQuery(con, "
+WITH cleaned AS (
+  SELECT
+    p.station_id,
+    m.tazid,
+    p.time_parsed,
+    EXTRACT('hour' FROM p.time_parsed) AS hour_num,
+
+    CASE
+      WHEN p.busy IS NULL
+       AND p.idle IS NULL
+       AND p.fast_busy IS NULL
+       AND p.fast_idle IS NULL
+       AND p.slow_busy IS NULL
+       AND p.slow_idle IS NULL
+      THEN 1 ELSE 0
+    END AS all_state_null,
+
+    CASE
+      WHEN p.busy + p.idle > 0
+      THEN p.busy * 1.0 / (p.busy + p.idle)
+      ELSE NULL
+    END AS utilisation
+
+  FROM station_parsed p
+  LEFT JOIN station_meta m
+    ON p.station_id = m.station_id
+),
+
+valid AS (
+  SELECT *
+  FROM cleaned
+  WHERE all_state_null = 0
+    AND utilisation BETWEEN 0 AND 1
+    AND time_parsed IS NOT NULL
+    AND tazid IS NOT NULL
+)
+
+SELECT
+  tazid,
+  hour_num,
+  AVG(utilisation) AS mean_utilisation,
+  COUNT(*) AS n_readings
+FROM valid
+GROUP BY tazid, hour_num
+ORDER BY tazid, hour_num;
+")
+  
+  # -----------------------------
+  # Sort zones by overall mean utilisation
+  # -----------------------------
+  
+  zone_order <- zone_hour_util |>
+    group_by(tazid) |>
+    summarise(
+      overall_mean_utilisation = mean(mean_utilisation, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    arrange(overall_mean_utilisation) |>
+    mutate(zone_rank = row_number())
+  
+  zone_hour_plot <- zone_hour_util |>
+    left_join(zone_order, by = "tazid")
+  
+  # -----------------------------
+  # Heatmap 
+  # -----------------------------
+  
+  p_zone_hour_heatmap <- ggplot(
+    zone_hour_plot,
+    aes(
+      x = hour_num,
+      y = zone_rank,
+      fill = mean_utilisation * 100
+    )
+  ) +
+    geom_tile() +
+    scale_fill_gradientn(
+      colours = c(
+        "#f7f7d0",
+        "#f0d264",
+        "#f89c3d",
+        "#f04b20",
+        "#b10026"
+      ),
+      name = "Mean utilisation (%)"
+    ) +
+    labs(
+      title = "Heatmap of Mean Utilisation by Traffic Zone and Hour of Day",
+      x = "Hour of Day",
+      y = "Traffic zones sorted by mean utilisation, low to high"
+    ) +
+    theme_minimal()
+  
+  p_zone_hour_heatmap
+  
+  ggsave(
+    "outputs/figures/zone_hour_utilisation_heatmap.png",
+    p_zone_hour_heatmap,
+    width = 10,
+    height = 6,
+    dpi = 300
+  )
+  
+  dbDisconnect(con, shutdown = TRUE)
+```
+
+#### Rationale
+
+Some true full occupancy is possible, especially for small fast-charging stations. However, persistent full occupancy across many 5-minute intervals can also signal stale sensor states or data imputation. A blanket removal would risk deleting genuine high-demand stations, while keeping everything may inflate utilisation and distort GWR response variables.
+
+#### Decision and caveat
+
+Recommended rule: flag stations where full-occupancy rows exceed 5% of valid readings. For these stations, exclude flagged full-occupancy rows from primary utilisation calculations, but retain an alternative “raw utilisation” version for sensitivity checks. The caveat is that the 5% threshold is defensible only if the distribution shows a clear break or long right tail; if not, use threshold sensitivity rather than a single hard cut.
+
+### **4. Check other data quality issues**
+
+#### Issue and rule
+
+Before aggregation, check for duplicate timestamps, impossible values, utilisation outside 0 to 1, stations with too few readings, inconsistent pile totals, price anomalies, and session anomalies.
+
+```{r}
+# 04_general_quality_checks.R
+
+library(tidyverse)
+library(DBI)
+library(duckdb)
+library(fs)
+library(janitor)
+
+dir_create("data/processed")
+dir_create("outputs/figures")
+dir_create("data/processed/duckdb_tmp")
+
+raw_dir <- "raw/20220901-20230228_station-raw"
+
+# Close old connection first if it exists
+try(dbDisconnect(con, shutdown = TRUE), silent = TRUE)
+
+con <- dbConnect(
+  duckdb(),
+  dbdir = "data/processed/urbanev.duckdb",
+  read_only = FALSE,
+  config = list(
+    memory_limit = "4GB",
+    threads = "2",
+    temp_directory = "data/processed/duckdb_tmp"
+  )
+)
+
+
+# -----------------------------
+# Load station metadata
+# -----------------------------
+
+station_meta <- read_csv(
+  file.path(raw_dir, "station_information.csv"),
+  show_col_types = FALSE
+) |>
+  clean_names() |>
+  mutate(station_id = as.integer(station_id))
+
+dbWriteTable(
+  con,
+  "station_meta",
+  station_meta,
+  overwrite = TRUE
+)
+
+
+# -----------------------------
+# 1. General row-level quality summary
+# -----------------------------
+# Important:
+# This does not join duplicate timestamp checks.
+# It aggregates directly from station_parsed to avoid memory blow-up.
+
+quality_summary_wide <- dbGetQuery(con, "
+WITH base AS (
+  SELECT
+    p.station_id,
+    p.time_parsed,
+    p.busy,
+    p.idle,
+    p.fast_busy,
+    p.fast_idle,
+    p.slow_busy,
+    p.slow_idle,
+    p.s_price,
+    p.e_price,
+    p.duration,
+    p.volume,
+    m.charge_count,
+
+    CASE
+      WHEN p.busy IS NULL
+       AND p.idle IS NULL
+       AND p.fast_busy IS NULL
+       AND p.fast_idle IS NULL
+       AND p.slow_busy IS NULL
+       AND p.slow_idle IS NULL
+      THEN 1 ELSE 0
+    END AS all_state_null,
+
+    CASE
+      WHEN p.busy + p.idle > 0
+      THEN p.busy * 1.0 / (p.busy + p.idle)
+      ELSE NULL
+    END AS utilisation
+
+  FROM station_parsed p
+  LEFT JOIN station_meta m
+    ON p.station_id = m.station_id
+)
+
+SELECT
+  COUNT(*) AS rows,
+
+  SUM(
+    CASE
+      WHEN busy < 0
+        OR idle < 0
+        OR fast_busy < 0
+        OR fast_idle < 0
+        OR slow_busy < 0
+        OR slow_idle < 0
+      THEN 1 ELSE 0
+    END
+  ) AS negative_state_rows,
+
+  SUM(
+    CASE
+      WHEN utilisation < 0 OR utilisation > 1
+      THEN 1 ELSE 0
+    END
+  ) AS invalid_utilisation_rows,
+
+  SUM(
+    CASE
+      WHEN all_state_null = 0
+       AND busy IS NOT NULL
+       AND idle IS NOT NULL
+       AND charge_count IS NOT NULL
+       AND busy + idle != charge_count
+      THEN 1 ELSE 0
+    END
+  ) AS pile_total_mismatch_rows,
+
+  SUM(
+    CASE
+      WHEN s_price < 0
+        OR e_price < 0
+        OR e_price < s_price
+      THEN 1 ELSE 0
+    END
+  ) AS price_invalid_rows,
+
+  SUM(
+    CASE
+      WHEN duration < 0
+      THEN 1 ELSE 0
+    END
+  ) AS duration_invalid_rows,
+
+  SUM(
+    CASE
+      WHEN volume < 0
+      THEN 1 ELSE 0
+    END
+  ) AS volume_invalid_rows,
+
+  SUM(all_state_null) AS all_state_null_rows
+
+FROM base;
+")
+  
+  quality_summary <- quality_summary_wide |>
+    pivot_longer(
+      everything(),
+      names_to = "issue",
+      values_to = "rows"
+    )
+  
+  quality_summary
+  
+  write_csv(
+    quality_summary,
+    "data/processed/general_quality_summary.csv"
+  )
+  
+  
+  # -----------------------------
+  # 2. Duplicate timestamp summary
+  # -----------------------------
+  # Calculated separately to avoid a large join.
+  
+  duplicate_summary <- dbGetQuery(con, "
+WITH dup_keys AS (
+  SELECT
+    station_id,
+    time_parsed,
+    COUNT(*) AS n
+  FROM station_parsed
+  WHERE time_parsed IS NOT NULL
+  GROUP BY station_id, time_parsed
+  HAVING COUNT(*) > 1
+)
+
+SELECT
+  COALESCE(SUM(n), 0) AS duplicate_rows,
+  COALESCE(COUNT(*), 0) AS duplicate_station_time_keys
+FROM dup_keys;
+")
+  
+  duplicate_summary
+  
+  write_csv(
+    duplicate_summary,
+    "data/processed/duplicate_timestamp_summary.csv"
+  )
+  
+  
+  # -----------------------------
+  # 3. Duplicate timestamp by station
+  # -----------------------------
+  
+  duplicate_by_station <- dbGetQuery(con, "
+WITH dup_keys AS (
+  SELECT
+    station_id,
+    time_parsed,
+    COUNT(*) AS n
+  FROM station_parsed
+  WHERE time_parsed IS NOT NULL
+  GROUP BY station_id, time_parsed
+  HAVING COUNT(*) > 1
+)
+
+SELECT
+  station_id,
+  SUM(n) AS duplicate_rows,
+  COUNT(*) AS duplicate_time_keys
+FROM dup_keys
+GROUP BY station_id
+ORDER BY duplicate_rows DESC;
+")
+  
+  write_csv(
+    duplicate_by_station,
+    "data/processed/duplicate_by_station.csv"
+  )
+  
+  
+  # -----------------------------
+  # 4. Coverage by station
+  # -----------------------------
+  # This avoids row-level duplicate joins.
+  # It aggregates directly at station level.
+  
+  coverage_by_station <- dbGetQuery(con, "
+WITH base AS (
+  SELECT
+    p.station_id,
+    p.time_parsed,
+    p.busy,
+    p.idle,
+    p.fast_busy,
+    p.fast_idle,
+    p.slow_busy,
+    p.slow_idle,
+    p.s_price,
+    p.e_price,
+    p.duration,
+    p.volume,
+    m.charge_count,
+
+    CASE
+      WHEN p.busy IS NULL
+       AND p.idle IS NULL
+       AND p.fast_busy IS NULL
+       AND p.fast_idle IS NULL
+       AND p.slow_busy IS NULL
+       AND p.slow_idle IS NULL
+      THEN 1 ELSE 0
+    END AS all_state_null,
+
+    CASE
+      WHEN p.busy + p.idle > 0
+      THEN p.busy * 1.0 / (p.busy + p.idle)
+      ELSE NULL
+    END AS utilisation
+
+  FROM station_parsed p
+  LEFT JOIN station_meta m
+    ON p.station_id = m.station_id
+)
+
+SELECT
+  station_id,
+
+  COUNT(*) AS total_rows,
+
+  SUM(
+    CASE
+      WHEN all_state_null = 0
+       AND time_parsed IS NOT NULL
+      THEN 1 ELSE 0
+    END
+  ) AS valid_rows,
+
+  DATE_DIFF('minute', MIN(time_parsed), MAX(time_parsed)) / 5 + 1
+    AS expected_rows,
+
+  SUM(
+    CASE
+      WHEN all_state_null = 0
+       AND time_parsed IS NOT NULL
+      THEN 1 ELSE 0
+    END
+  ) * 1.0 /
+  NULLIF(DATE_DIFF('minute', MIN(time_parsed), MAX(time_parsed)) / 5 + 1, 0)
+    AS coverage_rate,
+
+  SUM(
+    CASE
+      WHEN busy < 0
+        OR idle < 0
+        OR fast_busy < 0
+        OR fast_idle < 0
+        OR slow_busy < 0
+        OR slow_idle < 0
+        OR utilisation < 0
+        OR utilisation > 1
+        OR (
+          all_state_null = 0
+          AND busy IS NOT NULL
+          AND idle IS NOT NULL
+          AND charge_count IS NOT NULL
+          AND busy + idle != charge_count
+        )
+        OR s_price < 0
+        OR e_price < 0
+        OR e_price < s_price
+        OR duration < 0
+        OR volume < 0
+      THEN 1 ELSE 0
+    END
+  ) AS invalid_rows,
+
+  SUM(
+    CASE
+      WHEN busy < 0
+        OR idle < 0
+        OR fast_busy < 0
+        OR fast_idle < 0
+        OR slow_busy < 0
+        OR slow_idle < 0
+        OR utilisation < 0
+        OR utilisation > 1
+        OR (
+          all_state_null = 0
+          AND busy IS NOT NULL
+          AND idle IS NOT NULL
+          AND charge_count IS NOT NULL
+          AND busy + idle != charge_count
+        )
+        OR s_price < 0
+        OR e_price < s_price
+        OR duration < 0
+        OR volume < 0
+      THEN 1 ELSE 0
+    END
+  ) * 1.0 /
+  NULLIF(
+    SUM(
+      CASE
+        WHEN all_state_null = 0
+         AND time_parsed IS NOT NULL
+        THEN 1 ELSE 0
+      END
+    ),
+    0
+  ) AS invalid_pct,
+
+  MIN(time_parsed) AS min_time,
+  MAX(time_parsed) AS max_time
+
+FROM base
+GROUP BY station_id
+ORDER BY station_id;
+")
+  
+  summary(coverage_by_station$coverage_rate)
+  
+  write_csv(
+    coverage_by_station,
+    "data/processed/coverage_by_station.csv"
+  )
+  
+  
+  # -----------------------------
+  # 5. Add duplicate counts to station coverage
+  # -----------------------------
+  
+  coverage_by_station <- coverage_by_station |>
+    left_join(
+      duplicate_by_station,
+      by = "station_id"
+    ) |>
+    mutate(
+      duplicate_rows = replace_na(duplicate_rows, 0),
+      duplicate_time_keys = replace_na(duplicate_time_keys, 0)
+    )
+  
+  write_csv(
+    coverage_by_station,
+    "data/processed/coverage_by_station_with_duplicates.csv"
+  )
+  
+  
+  # -----------------------------
+  # 6. Coverage histogram
+  # -----------------------------
+  
+  p_coverage <- ggplot(
+    coverage_by_station,
+    aes(coverage_rate)
+  ) +
+    geom_histogram(bins = 40) +
+    labs(
+      title = "Station-level valid reading coverage",
+      x = "Coverage rate",
+      y = "Number of stations"
+    )
+  
+  p_coverage
+  
+  ggsave(
+    "outputs/figures/station_coverage_histogram.png",
+    p_coverage,
+    width = 8,
+    height = 5,
+    dpi = 300
+  )
+  
+  
+  # -----------------------------
+  # 7. Stations requiring review
+  # -----------------------------
+  
+  stations_requiring_review <- coverage_by_station |>
+    filter(
+      coverage_rate < 0.70 |
+        invalid_pct > 0.10 |
+        duplicate_rows > 0
+    ) |>
+    arrange(coverage_rate)
+  
+  stations_requiring_review
+  
+  write_csv(
+    stations_requiring_review,
+    "data/processed/stations_requiring_quality_review.csv"
+  )
+  
+  
+  # -----------------------------
+  # 8. Add action recommendation
+  # -----------------------------
+  
+  coverage_decision <- coverage_by_station |>
+    mutate(
+      quality_action = case_when(
+        coverage_rate < 0.50 ~
+          "Review before GWR/GWML; station may be unsuitable for demand modelling",
+        coverage_rate < 0.70 ~
+          "Flag as low coverage; include in KDE/NCKDE, exclude or sensitivity-test in GWR/GWML",
+        invalid_pct > 0.10 ~
+          "Flag as high invalid share; inspect before modelling",
+        duplicate_rows > 0 ~
+          "Flag duplicate timestamps; inspect before modelling",
+        TRUE ~
+          "Pass"
+      )
+    )
+  
+  write_csv(
+    coverage_decision,
+    "data/processed/coverage_decision.csv"
+  )
+  
+  
+  dbDisconnect(con, shutdown = TRUE)
+```
+
+#### Rationale
+
+These checks protect the station-level features from being driven by sensor errors rather than demand. Duplicate timestamps and impossible utilisation directly affect aggregation, while low-coverage stations may be unreliable for seasonal slope, weekday/weekend comparison, or volatility.
+
+#### Decision and caveat
+
+Remove impossible row-level values from feature computation. Flag stations with coverage below 70% as low coverage. Do not automatically drop them from Objective 1 because KDE/NCKDE only needs location, but consider excluding them from Objective 2 or running sensitivity checks with and without them.
+
+### **5. Classify fast, slow, and mixed stations**
+
+#### Issue and rule
+
+The project requires separate analysis by charger type. The rule is to use metadata counts where available: fast-only if fast_count \> 0 and slow_count == 0, slow-only if slow_count \> 0 and fast_count == 0, mixed if both are positive. A dominant type is then assigned by pile share.
+
+```{r}
+# 05_charger_type_classification.R
+
+library(tidyverse)
+library(DBI)
+library(duckdb)
+library(fs)
+library(janitor)
+
+dir_create("data/processed")
+dir_create("outputs/figures")
+
+raw_dir <- "raw/20220901-20230228_station-raw"
+
+# -----------------------------
+# Connect to DuckDB
+# -----------------------------
+
+try(dbDisconnect(con, shutdown = TRUE), silent = TRUE)
+
+con <- dbConnect(
+  duckdb(),
+  dbdir = "data/processed/urbanev.duckdb",
+  read_only = FALSE,
+  config = list(
+    memory_limit = "4GB",
+    threads = "2",
+    temp_directory = "data/processed/duckdb_tmp"
+  )
+)
+
+
+# -----------------------------
+# Load station metadata
+# -----------------------------
+
+station_meta <- read_csv(
+  file.path(raw_dir, "station_information.csv"),
+  show_col_types = FALSE
+) |>
+  clean_names() |>
+  mutate(station_id = as.integer(station_id))
+
+
+# -----------------------------
+# Derive observed fast / slow pile counts
+# -----------------------------
+
+station_type_from_readings <- dbGetQuery(con, "
+WITH valid AS (
+  SELECT
+    station_id,
+    fast_busy,
+    fast_idle,
+    slow_busy,
+    slow_idle,
+
+    CASE
+      WHEN busy IS NULL
+       AND idle IS NULL
+       AND fast_busy IS NULL
+       AND fast_idle IS NULL
+       AND slow_busy IS NULL
+       AND slow_idle IS NULL
+      THEN 1 ELSE 0
+    END AS all_state_null
+
+  FROM station_parsed
+),
+
+agg AS (
+  SELECT
+    station_id,
+
+    MAX(fast_busy + fast_idle) AS observed_fast_count,
+    MAX(slow_busy + slow_idle) AS observed_slow_count,
+
+    MAX(fast_busy + fast_idle + slow_busy + slow_idle) AS observed_total_type_count,
+
+    COUNT(*) AS total_rows,
+
+    SUM(CASE WHEN all_state_null = 0 THEN 1 ELSE 0 END) AS non_null_rows
+
+  FROM valid
+  WHERE all_state_null = 0
+  GROUP BY station_id
+)
+
+SELECT *
+FROM agg
+ORDER BY station_id;
+")
+  
+  
+  # -----------------------------
+  # Classify station type
+  # -----------------------------
+  
+  station_type <- station_meta |>
+    left_join(station_type_from_readings, by = "station_id") |>
+    mutate(
+      observed_fast_count = replace_na(observed_fast_count, 0),
+      observed_slow_count = replace_na(observed_slow_count, 0),
+      
+      observed_total_type_count =
+        observed_fast_count + observed_slow_count,
+      
+      fast_share = case_when(
+        observed_total_type_count > 0 ~
+          observed_fast_count / observed_total_type_count,
+        TRUE ~ NA_real_
+      ),
+      
+      slow_share = case_when(
+        observed_total_type_count > 0 ~
+          observed_slow_count / observed_total_type_count,
+        TRUE ~ NA_real_
+      ),
+      
+      station_type = case_when(
+        observed_fast_count > 0 & observed_slow_count == 0 ~ "fast_only",
+        observed_fast_count == 0 & observed_slow_count > 0 ~ "slow_only",
+        observed_fast_count > 0 & observed_slow_count > 0 ~ "mixed",
+        TRUE ~ "unknown"
+      ),
+      
+      dominant_type = case_when(
+        station_type == "fast_only" ~ "fast",
+        station_type == "slow_only" ~ "slow",
+        station_type == "mixed" & fast_share >= 0.5 ~ "fast_dominant_mixed",
+        station_type == "mixed" & fast_share < 0.5 ~ "slow_dominant_mixed",
+        TRUE ~ "unknown"
+      ),
+      
+      mixed_flag = station_type == "mixed",
+      
+      pile_count_type_mismatch = case_when(
+        is.na(charge_count) ~ NA,
+        observed_total_type_count == 0 ~ NA,
+        charge_count != observed_total_type_count ~ TRUE,
+        TRUE ~ FALSE
+      )
+    )
+  
+  
+  # -----------------------------
+  # Station type summary
+  # -----------------------------
+  
+  station_type_summary <- station_type |>
+    count(station_type, dominant_type) |>
+    mutate(
+      pct = n / sum(n)
+    ) |>
+    arrange(desc(n))
+  
+  station_type_summary
+  
+  write_csv(
+    station_type_summary,
+    "data/processed/station_type_summary.csv"
+  )
+  
+  
+  # -----------------------------
+  # Pile type summary
+  # -----------------------------
+  
+  pile_type_summary <- station_type |>
+    summarise(
+      stations = n(),
+      total_piles_metadata = sum(charge_count, na.rm = TRUE),
+      observed_fast_piles = sum(observed_fast_count, na.rm = TRUE),
+      observed_slow_piles = sum(observed_slow_count, na.rm = TRUE),
+      observed_total_piles =
+        observed_fast_piles + observed_slow_piles,
+      fast_pile_share =
+        observed_fast_piles / observed_total_piles,
+      slow_pile_share =
+        observed_slow_piles / observed_total_piles,
+      pile_count_mismatch_stations =
+        sum(pile_count_type_mismatch, na.rm = TRUE)
+    )
+  
+  pile_type_summary
+  
+  write_csv(
+    pile_type_summary,
+    "data/processed/pile_type_summary.csv"
+  )
+  
+  
+  # -----------------------------
+  # Check against proposal Figure A1
+  # -----------------------------
+  
+  figure_a1_check <- station_type_summary |>
+    mutate(
+      expected_from_proposal = case_when(
+        station_type == "slow_only" ~ "Proposal Figure A1 expected around 1,516 stations, about 90%",
+        station_type == "fast_only" ~ "Proposal Figure A1 expected around 121 stations, about 7%",
+        station_type == "mixed" ~ "Proposal Figure A1 expected around 45 stations, about 3%",
+        TRUE ~ "No proposal benchmark"
+      )
+    )
+  
+  figure_a1_check
+  
+  write_csv(
+    figure_a1_check,
+    "data/processed/figure_a1_charger_type_check.csv"
+  )
+  
+  
+  # -----------------------------
+  # Plot station type counts
+  # -----------------------------
+  
+  p_station_type <- ggplot(
+    station_type,
+    aes(dominant_type)
+  ) +
+    geom_bar() +
+    labs(
+      title = "Station Classification by Dominant Charger Type",
+      x = "Dominant type",
+      y = "Number of stations"
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 30, hjust = 1)
+    )
+  
+  p_station_type
+  
+  ggsave(
+    "outputs/figures/station_classification_by_dominant_type.png",
+    p_station_type,
+    width = 8,
+    height = 5,
+    dpi = 300
+  )
+  
+  
+  # -----------------------------
+  # Plot station type composition
+  # -----------------------------
+  
+  p_station_type_simple <- ggplot(
+    station_type_summary,
+    aes(
+      x = station_type,
+      y = n
+    )
+  ) +
+    geom_col() +
+    geom_text(
+      aes(label = paste0(n, " (", round(pct * 100, 1), "%)")),
+      vjust = -0.3,
+      size = 3.5
+    ) +
+    labs(
+      title = "Network Composition by Charger Type",
+      x = "Station type",
+      y = "Number of stations"
+    ) +
+    theme_minimal()
+  
+  p_station_type_simple
+  
+  ggsave(
+    "outputs/figures/network_composition_by_charger_type.png",
+    p_station_type_simple,
+    width = 8,
+    height = 5,
+    dpi = 300
+  )
+  
+  
+  # -----------------------------
+  # Save full station type table
+  # -----------------------------
+  
+  write_csv(
+    station_type,
+    "data/processed/station_type_classification.csv"
+  )
+  
+  write_rds(
+    station_type,
+    "data/processed/station_type_classification.rds"
+  )
+  
+  
+  # -----------------------------
+  # Close connection
+  # -----------------------------
+  
+  dbDisconnect(con, shutdown = TRUE)
+```
+
+#### Rationale
+
+This avoids classifying stations only from observed busy/idle readings, which may be affected by missingness or sensor error. The dominant-type rule preserves mixed stations without allowing a small number of mixed piles to distort the main fast/slow comparison.
+
+#### Decision and caveat
+
+Use dominant_type for modelling strata and keep mixed_flag as a control or sensitivity variable. Validate the counts against Figure A1: approximately 90% slow-only, 7% fast-only, and 3% mixed. If the counts differ materially, investigate whether metadata field names or definitions have been read incorrectly.
+
+### **6. Create the cleaned row-level table**
+
+#### Issue and rule
+
+The cleaned row-level table should exclude null rows and impossible values. Full-occupancy anomaly rows should be flagged and excluded from the primary utilisation measure, but kept for audit and sensitivity.
+
+```{r}
+# 06_create_clean_row_level_table.R
+
+library(tidyverse)
+library(DBI)
+library(duckdb)
+library(fs)
+library(janitor)
+library(glue)
+
+dir_create("data/processed")
+dir_create("data/processed/duckdb_tmp")
+
+raw_dir <- "raw/20220901-20230228_station-raw"
+station_dir <- file.path(raw_dir, "charge_5min")
+
+# Use a separate DB file to avoid lock conflict
+db_path <- "data/processed/urbanev_step06.duckdb"
+
+try(dbDisconnect(con, shutdown = TRUE), silent = TRUE)
+
+con <- dbConnect(
+  duckdb(),
+  dbdir = db_path,
+  read_only = FALSE,
+  config = list(
+    memory_limit = "4GB",
+    threads = "2",
+    temp_directory = "data/processed/duckdb_tmp"
+  )
+)
+
+station_glob <- normalizePath(
+  file.path(station_dir, "*.csv"),
+  mustWork = FALSE
+)
+
+station_glob_sql <- gsub("\\\\", "/", station_glob)
+
+# -----------------------------
+# Recreate station_raw
+# -----------------------------
+
+dbExecute(con, glue("
+CREATE OR REPLACE VIEW station_raw AS
+SELECT *
+FROM read_csv(
+  '{station_glob_sql}',
+  filename = true,
+  union_by_name = true,
+  all_varchar = true,
+  header = true,
+  ignore_errors = true
+);
+"))
+
+# -----------------------------
+# Recreate station_parsed
+# -----------------------------
+
+dbExecute(con, "
+CREATE OR REPLACE VIEW station_parsed AS
+SELECT
+  regexp_extract(filename, '([0-9]+)\\.csv$', 1)::INTEGER AS station_id,
+
+  NULLIF(TRIM(time), '') AS time_raw,
+
+  COALESCE(
+    try_strptime(NULLIF(TRIM(time), ''), '%d/%m/%Y %H:%M'),
+    try_strptime(NULLIF(TRIM(time), ''), '%d/%m/%Y %H:%M:%S'),
+    try_strptime(NULLIF(TRIM(time), ''), '%Y-%m-%d %H:%M:%S'),
+    try_strptime(NULLIF(TRIM(time), ''), '%Y-%m-%d %H:%M'),
+    try_strptime(NULLIF(TRIM(time), ''), '%Y/%m/%d %H:%M:%S'),
+    try_strptime(NULLIF(TRIM(time), ''), '%Y/%m/%d %H:%M')
+  ) AS time_parsed,
+
+  try_cast(NULLIF(TRIM(busy), '') AS DOUBLE) AS busy,
+  try_cast(NULLIF(TRIM(idle), '') AS DOUBLE) AS idle,
+  try_cast(NULLIF(TRIM(s_price), '') AS DOUBLE) AS s_price,
+  try_cast(NULLIF(TRIM(e_price), '') AS DOUBLE) AS e_price,
+  try_cast(NULLIF(TRIM(fast_busy), '') AS DOUBLE) AS fast_busy,
+  try_cast(NULLIF(TRIM(fast_idle), '') AS DOUBLE) AS fast_idle,
+  try_cast(NULLIF(TRIM(slow_busy), '') AS DOUBLE) AS slow_busy,
+  try_cast(NULLIF(TRIM(slow_idle), '') AS DOUBLE) AS slow_idle,
+  try_cast(NULLIF(TRIM(duration), '') AS DOUBLE) AS duration,
+  try_cast(NULLIF(TRIM(volume), '') AS DOUBLE) AS volume
+
+FROM station_raw;
+")
+
+# -----------------------------
+# Load helper tables
+# -----------------------------
+
+station_type <- read_csv(
+  "data/processed/station_type_classification.csv",
+  show_col_types = FALSE
+) |>
+  clean_names() |>
+  select(
+    station_id,
+    station_type,
+    dominant_type,
+    mixed_flag
+  ) |>
+  mutate(station_id = as.integer(station_id))
+
+full_occ_by_station <- read_csv(
+  "data/processed/full_occ_by_station.csv",
+  show_col_types = FALSE
+) |>
+  clean_names() |>
+  select(
+    station_id,
+    full_occ_pct
+  ) |>
+  mutate(station_id = as.integer(station_id))
+
+dbWriteTable(
+  con,
+  "station_type_lookup",
+  station_type,
+  overwrite = TRUE
+)
+
+dbWriteTable(
+  con,
+  "full_occ_lookup",
+  full_occ_by_station,
+  overwrite = TRUE
+)
+
+# -----------------------------
+# Create clean row-level table
+# -----------------------------
+
+dbExecute(con, "
+CREATE OR REPLACE TABLE clean_station_5min_rows AS
+WITH base AS (
+  SELECT
+    p.station_id,
+    p.time_parsed AS time,
+    p.busy,
+    p.idle,
+    p.fast_busy,
+    p.fast_idle,
+    p.slow_busy,
+    p.slow_idle,
+    p.s_price,
+    p.e_price,
+    p.duration,
+    p.volume,
+
+    st.station_type,
+    st.dominant_type,
+    st.mixed_flag,
+
+    fo.full_occ_pct,
+
+    CASE
+      WHEN p.busy IS NULL
+       AND p.idle IS NULL
+       AND p.fast_busy IS NULL
+       AND p.fast_idle IS NULL
+       AND p.slow_busy IS NULL
+       AND p.slow_idle IS NULL
+      THEN 1 ELSE 0
+    END AS all_state_null,
+
+    p.busy + p.idle AS total_recorded_piles,
+
+    CASE
+      WHEN p.busy + p.idle > 0
+      THEN p.busy * 1.0 / (p.busy + p.idle)
+      ELSE NULL
+    END AS utilisation
+
+  FROM station_parsed p
+  LEFT JOIN station_type_lookup st
+    ON p.station_id = st.station_id
+  LEFT JOIN full_occ_lookup fo
+    ON p.station_id = fo.station_id
+),
+
+flagged AS (
+  SELECT
+    *,
+
+    CASE
+      WHEN busy < 0
+        OR idle < 0
+        OR fast_busy < 0
+        OR fast_idle < 0
+        OR slow_busy < 0
+        OR slow_idle < 0
+      THEN 1 ELSE 0
+    END AS negative_state,
+
+    CASE
+      WHEN utilisation < 0 OR utilisation > 1
+      THEN 1 ELSE 0
+    END AS utilisation_invalid,
+
+    CASE
+      WHEN s_price < 0
+        OR e_price < 0
+        OR e_price < s_price
+      THEN 1 ELSE 0
+    END AS price_invalid,
+
+    CASE
+      WHEN duration < 0
+      THEN 1 ELSE 0
+    END AS duration_invalid,
+
+    CASE
+      WHEN volume < 0
+      THEN 1 ELSE 0
+    END AS volume_invalid,
+
+    CASE
+      WHEN total_recorded_piles > 0
+       AND busy = total_recorded_piles
+       AND idle = 0
+      THEN 1 ELSE 0
+    END AS full_occupancy_row,
+
+    CASE
+      WHEN full_occ_pct > 0.05
+      THEN 1 ELSE 0
+    END AS high_full_occ_station
+
+  FROM base
+),
+
+final AS (
+  SELECT
+    *,
+
+    CASE
+      WHEN all_state_null = 1
+        OR time IS NULL
+        OR negative_state = 1
+        OR utilisation_invalid = 1
+        OR price_invalid = 1
+        OR duration_invalid = 1
+        OR volume_invalid = 1
+        OR (
+          high_full_occ_station = 1
+          AND full_occupancy_row = 1
+        )
+      THEN 1 ELSE 0
+    END AS exclude_primary,
+
+    CASE
+      WHEN all_state_null = 1
+        OR time IS NULL
+        OR negative_state = 1
+        OR utilisation_invalid = 1
+        OR price_invalid = 1
+        OR duration_invalid = 1
+        OR volume_invalid = 1
+        OR (
+          high_full_occ_station = 1
+          AND full_occupancy_row = 1
+        )
+      THEN NULL
+      ELSE utilisation
+    END AS utilisation_primary,
+
+    EXTRACT('hour' FROM time) AS hour,
+    CAST(time AS DATE) AS date,
+    DATE_TRUNC('month', time) AS month,
+    EXTRACT('dow' FROM time) AS dow_num,
+
+    CASE
+      WHEN EXTRACT('dow' FROM time) IN (0, 6)
+      THEN 1 ELSE 0
+    END AS is_weekend,
+
+    CASE
+      WHEN EXTRACT('hour' FROM time) BETWEEN 9 AND 16
+      THEN 'daytime'
+      WHEN EXTRACT('hour' FROM time) >= 22
+        OR EXTRACT('hour' FROM time) <= 5
+      THEN 'overnight'
+      ELSE 'other'
+    END AS time_band
+
+  FROM flagged
+)
+
+SELECT *
+FROM final;
+")
+  
+  # -----------------------------
+  # Clean audit
+  # -----------------------------
+  
+  clean_audit <- dbGetQuery(con, "
+SELECT
+  COUNT(*) AS total_input_rows,
+
+  SUM(CASE WHEN all_state_null = 1 THEN 1 ELSE 0 END)
+    AS all_state_null_rows,
+
+  SUM(CASE WHEN exclude_primary = 1 THEN 1 ELSE 0 END)
+    AS excluded_primary_rows,
+
+  SUM(CASE WHEN exclude_primary = 0 THEN 1 ELSE 0 END)
+    AS retained_primary_rows,
+
+  SUM(CASE WHEN exclude_primary = 1 THEN 1 ELSE 0 END) * 1.0 / COUNT(*)
+    AS excluded_primary_pct,
+
+  SUM(CASE WHEN utilisation_primary IS NULL THEN 1 ELSE 0 END)
+    AS utilisation_primary_missing_rows
+
+FROM clean_station_5min_rows;
+")
+  
+  clean_audit
+  
+  write_csv(
+    clean_audit,
+    "data/processed/clean_row_audit.csv"
+  )
+  
+  clean_audit_by_station <- dbGetQuery(con, "
+SELECT
+  station_id,
+  COUNT(*) AS total_rows,
+
+  SUM(CASE WHEN all_state_null = 1 THEN 1 ELSE 0 END)
+    AS all_state_null_rows,
+
+  SUM(CASE WHEN exclude_primary = 1 THEN 1 ELSE 0 END)
+    AS excluded_primary_rows,
+
+  SUM(CASE WHEN exclude_primary = 0 THEN 1 ELSE 0 END)
+    AS retained_primary_rows,
+
+  SUM(CASE WHEN exclude_primary = 1 THEN 1 ELSE 0 END) * 1.0 / COUNT(*)
+    AS excluded_primary_pct,
+
+  AVG(utilisation_primary) AS mean_utilisation_primary
+
+FROM clean_station_5min_rows
+GROUP BY station_id
+ORDER BY station_id;
+")
+  
+  write_csv(
+    clean_audit_by_station,
+    "data/processed/clean_row_audit_by_station.csv"
+  )
+  
+  # Save a small sample only
+  clean_rows_sample <- dbGetQuery(con, "
+SELECT *
+FROM clean_station_5min_rows
+LIMIT 100000;
+")
+  
+  write_rds(
+    clean_rows_sample,
+    "data/processed/clean_station_5min_rows_sample.rds"
+  )
+  
+  dbDisconnect(con, shutdown = TRUE)
+```
+
+#### Rationale
+
+This gives one transparent row-level dataset from which all station features can be reproduced. It also prevents the cleaning from becoming a black box because every exclusion is tied to a named flag.
+
+#### Decision and caveat
+
+The project requires a station-level feature table with behavioural demand measures. The rule is to aggregate only from cleaned rows, while retaining quality indicators so that each station’s reliability is visible.
+
+### **7. Aggregate to station-level features**
+
+#### Issue and rule
+
+The project requires a station-level feature table with behavioural demand measures. The rule is to aggregate only from cleaned rows, while retaining quality indicators so that each station’s reliability is visible.
+
+```{r}
+# 07_station_level_features.R
+
+library(tidyverse)
+library(DBI)
+library(duckdb)
+library(fs)
+library(janitor)
+
+dir_create("data/processed")
+dir_create("data/processed/duckdb_tmp")
+
+raw_dir <- "raw/20220901-20230228_station-raw"
+db_path <- "data/processed/urbanev_step06.duckdb"
+
+# -----------------------------
+# Connect to Step 06 DuckDB
+# -----------------------------
+
+try(dbDisconnect(con, shutdown = TRUE), silent = TRUE)
+
+con <- dbConnect(
+  duckdb(),
+  dbdir = db_path,
+  read_only = FALSE,
+  config = list(
+    memory_limit = "4GB",
+    threads = "2",
+    temp_directory = "data/processed/duckdb_tmp"
+  )
+)
+
+
+# -----------------------------
+# Load station metadata
+# -----------------------------
+
+station_meta <- read_csv(
+  file.path(raw_dir, "station_information.csv"),
+  show_col_types = FALSE
+) |>
+  clean_names() |>
+  mutate(station_id = as.integer(station_id))
+
+dbWriteTable(
+  con,
+  "station_meta",
+  station_meta,
+  overwrite = TRUE
+)
+
+
+# -----------------------------
+# Check that clean row table exists
+# -----------------------------
+
+tables_available <- dbListTables(con)
+
+if (!"clean_station_5min_rows" %in% tables_available) {
+  stop(
+    "clean_station_5min_rows not found. Run 06_create_clean_row_level_table.R first."
+  )
+}
+
+
+# -----------------------------
+# Monthly utilisation table
+# -----------------------------
+
+monthly_util <- dbGetQuery(con, "
+WITH monthly AS (
+  SELECT
+    station_id,
+    month,
+    AVG(utilisation_primary) AS monthly_mean_util
+  FROM clean_station_5min_rows
+  WHERE utilisation_primary IS NOT NULL
+  GROUP BY station_id, month
+),
+
+indexed AS (
+  SELECT
+    station_id,
+    month,
+    monthly_mean_util,
+    ROW_NUMBER() OVER (
+      PARTITION BY station_id
+      ORDER BY month
+    ) AS month_index
+  FROM monthly
+),
+
+slope_components AS (
+  SELECT
+    station_id,
+    COUNT(*) AS n_months_valid,
+
+    AVG(month_index) AS mean_x,
+    AVG(monthly_mean_util) AS mean_y,
+
+    AVG(month_index * monthly_mean_util)
+      - AVG(month_index) * AVG(monthly_mean_util) AS cov_xy,
+
+    AVG(month_index * month_index)
+      - AVG(month_index) * AVG(month_index) AS var_x
+
+  FROM indexed
+  GROUP BY station_id
+)
+
+SELECT
+  station_id,
+  n_months_valid,
+
+  CASE
+    WHEN n_months_valid >= 4
+     AND var_x > 0
+    THEN cov_xy / var_x
+    ELSE NULL
+  END AS seasonal_slope
+
+FROM slope_components
+ORDER BY station_id;
+")
+  
+  write_csv(
+    monthly_util,
+    "data/processed/monthly_utilisation_slope.csv"
+  )
+  
+  
+  # -----------------------------
+  # Station-level feature aggregation
+  # -----------------------------
+  
+  station_features_core <- dbGetQuery(con, "
+SELECT
+  station_id,
+
+  ANY_VALUE(station_type) AS station_type,
+  ANY_VALUE(dominant_type) AS dominant_type,
+  ANY_VALUE(mixed_flag) AS mixed_flag,
+
+  COUNT(*) AS total_rows,
+
+  SUM(CASE WHEN all_state_null = 1 THEN 1 ELSE 0 END)
+    AS all_state_null_rows,
+
+  SUM(CASE WHEN utilisation_primary IS NOT NULL THEN 1 ELSE 0 END)
+    AS primary_valid_rows,
+
+  SUM(CASE WHEN utilisation_primary IS NOT NULL THEN 1 ELSE 0 END) * 1.0
+    / COUNT(*) AS primary_valid_pct,
+
+  AVG(full_occ_pct) AS full_occ_pct,
+
+  AVG(utilisation_primary) AS mean_utilisation,
+  MEDIAN(utilisation_primary) AS median_utilisation,
+  STDDEV(utilisation_primary) AS utilisation_sd,
+  QUANTILE_CONT(utilisation_primary, 0.75)
+    - QUANTILE_CONT(utilisation_primary, 0.25) AS utilisation_iqr,
+  QUANTILE_CONT(utilisation_primary, 0.95) AS peak_utilisation_p95,
+  MAX(utilisation_primary) AS max_utilisation,
+
+  AVG(CASE WHEN time_band = 'daytime' THEN utilisation_primary ELSE NULL END)
+    AS daytime_mean_utilisation,
+
+  AVG(CASE WHEN time_band = 'overnight' THEN utilisation_primary ELSE NULL END)
+    AS overnight_mean_utilisation,
+
+  AVG(CASE WHEN is_weekend = 0 THEN utilisation_primary ELSE NULL END)
+    AS weekday_mean_utilisation,
+
+  AVG(CASE WHEN is_weekend = 1 THEN utilisation_primary ELSE NULL END)
+    AS weekend_mean_utilisation,
+
+  AVG(CASE WHEN exclude_primary = 0 THEN duration ELSE NULL END)
+    AS mean_duration,
+
+  MEDIAN(CASE WHEN exclude_primary = 0 THEN duration ELSE NULL END)
+    AS median_duration,
+
+  AVG(CASE WHEN exclude_primary = 0 THEN volume ELSE NULL END)
+    AS mean_volume,
+
+  SUM(CASE WHEN exclude_primary = 0 THEN volume ELSE NULL END)
+    AS total_volume,
+
+  AVG(CASE WHEN exclude_primary = 0 THEN s_price ELSE NULL END)
+    AS mean_s_price,
+
+  AVG(CASE WHEN exclude_primary = 0 THEN e_price ELSE NULL END)
+    AS mean_e_price,
+
+  MEDIAN(CASE WHEN exclude_primary = 0 THEN s_price ELSE NULL END)
+    AS median_s_price,
+
+  MEDIAN(CASE WHEN exclude_primary = 0 THEN e_price ELSE NULL END)
+    AS median_e_price,
+
+  STDDEV(CASE WHEN exclude_primary = 0 THEN e_price ELSE NULL END)
+    AS price_sd,
+
+  AVG(
+    CASE
+      WHEN exclude_primary = 0
+       AND total_recorded_piles > 0
+       AND busy = 0
+       AND idle = total_recorded_piles
+      THEN 1
+      WHEN exclude_primary = 0 THEN 0
+      ELSE NULL
+    END
+  ) AS idle_prop,
+
+  AVG(
+    CASE
+      WHEN exclude_primary = 0
+       AND total_recorded_piles > 0
+       AND busy = total_recorded_piles
+       AND idle = 0
+      THEN 1
+      WHEN exclude_primary = 0 THEN 0
+      ELSE NULL
+    END
+  ) AS occupied_prop,
+
+  SUM(CASE WHEN exclude_primary = 1 THEN 1 ELSE 0 END)
+    AS excluded_primary_rows,
+
+  SUM(CASE WHEN exclude_primary = 1 THEN 1 ELSE 0 END) * 1.0
+    / COUNT(*) AS excluded_primary_pct
+
+FROM clean_station_5min_rows
+GROUP BY station_id
+ORDER BY station_id;
+")
+  
+  
+  # -----------------------------
+  # Join metadata and seasonal slope
+  # -----------------------------
+  
+  station_features <- station_meta |>
+    left_join(station_features_core, by = "station_id") |>
+    left_join(monthly_util, by = "station_id") |>
+    mutate(
+      null_pct = all_state_null_rows / total_rows,
+      
+      overnight_minus_daytime =
+        overnight_mean_utilisation - daytime_mean_utilisation,
+      
+      weekend_minus_weekday =
+        weekend_mean_utilisation - weekday_mean_utilisation,
+      
+      low_coverage_flag =
+        primary_valid_pct < 0.70,
+      
+      modelling_eligible =
+        !is.na(longitude) &
+        !is.na(latitude) &
+        primary_valid_pct >= 0.70 &
+        !is.na(mean_utilisation),
+      
+      issue_log = case_when(
+        is.na(longitude) | is.na(latitude) ~ "missing_coordinates",
+        is.na(mean_utilisation) ~ "missing_demand_features",
+        primary_valid_pct < 0.50 ~ "very_low_coverage",
+        primary_valid_pct < 0.70 ~ "low_coverage",
+        full_occ_pct > 0.05 ~ "high_full_occupancy",
+        TRUE ~ "pass"
+      )
+    )
+  
+  
+  # -----------------------------
+  # Final checks
+  # -----------------------------
+  
+  station_feature_check <- station_features |>
+    summarise(
+      stations_total = n(),
+      unique_station_ids = n_distinct(station_id),
+      duplicate_station_ids = n() - n_distinct(station_id),
+      
+      stations_modelling_eligible = sum(modelling_eligible, na.rm = TRUE),
+      stations_low_coverage = sum(low_coverage_flag, na.rm = TRUE),
+      
+      missing_coordinates = sum(is.na(longitude) | is.na(latitude)),
+      missing_mean_utilisation = sum(is.na(mean_utilisation)),
+      
+      mean_util_network = mean(mean_utilisation, na.rm = TRUE),
+      median_util_network = median(mean_utilisation, na.rm = TRUE),
+      
+      min_primary_valid_pct = min(primary_valid_pct, na.rm = TRUE),
+      median_primary_valid_pct = median(primary_valid_pct, na.rm = TRUE),
+      max_primary_valid_pct = max(primary_valid_pct, na.rm = TRUE)
+    )
+  
+  station_feature_check
+  
+  stopifnot(nrow(station_features) == 1682)
+  stopifnot(n_distinct(station_features$station_id) == 1682)
+  
+  
+  # -----------------------------
+  # Save outputs
+  # -----------------------------
+  
+  write_csv(
+    station_features,
+    "data/processed/station_level_features_week1.csv"
+  )
+  
+  write_rds(
+    station_features,
+    "data/processed/station_level_features_week1.rds"
+  )
+  
+  write_csv(
+    station_feature_check,
+    "data/processed/station_level_features_check.csv"
+  )
+  
+  
+  # -----------------------------
+  # quick summaries
+  # -----------------------------
+  
+  station_features |>
+    count(issue_log) |>
+    arrange(desc(n)) |>
+    write_csv("data/processed/station_feature_issue_summary.csv")
+  
+  station_features |>
+    count(dominant_type) |>
+    arrange(desc(n)) |>
+    write_csv("data/processed/station_feature_type_summary.csv")
+  
+  
+  # -----------------------------
+  # Close connection
+  # -----------------------------
+  
+  dbDisconnect(con, shutdown = TRUE)
+```
+
+#### Rationale
+
+This table is the bridge between the raw 5-minute data and the project objectives. Objective 1 uses station coordinates and charger type. Objective 2 uses station-level demand outcomes such as mean utilisation, volatility, peak-period behaviour, and seasonal slope.
+
+#### Decision and caveat
+
+Use this as the Week 1 analytical dataset. If too many stations fail the 70% coverage rule, do not drop them immediately; instead, run GWR/GWML with a less strict 60% threshold as a sensitivity check.
+
+### **8. Check whether cleaning threatens Objectives 1 and 2**
+
+#### Issue and rule
+
+Cleaning should not reduce the station sample so much that spatial modelling becomes unstable. The rule is to report sample size after each cleaning step, separately for fast, slow, and mixed stations.
+
+```{r}
+# 08_objective_support_check.R
+
+library(tidyverse)
+library(fs)
+library(janitor)
+
+dir_create("data/processed")
+
+# -----------------------------
+# Load station-level Week 1 table
+# -----------------------------
+
+station_features <- read_csv(
+  "data/processed/station_level_features_week1.csv",
+  show_col_types = FALSE
+) |>
+  clean_names()
+
+# -----------------------------
+# Basic table integrity check
+# -----------------------------
+
+table_integrity_check <- station_features |>
+  summarise(
+    n_rows = n(),
+    n_unique_station_ids = n_distinct(station_id),
+    duplicate_station_ids = n() - n_distinct(station_id),
+    missing_coordinates = sum(is.na(longitude) | is.na(latitude)),
+    missing_dominant_type = sum(is.na(dominant_type)),
+    missing_mean_utilisation = sum(is.na(mean_utilisation))
+  )
+
+table_integrity_check
+
+stopifnot(table_integrity_check$n_rows == 1682)
+stopifnot(table_integrity_check$duplicate_station_ids == 0)
+
+write_csv(
+  table_integrity_check,
+  "data/processed/objective_support_table_integrity_check.csv"
+)
+
+# -----------------------------
+# Objective support by charger type
+# -----------------------------
+
+objective_support <- station_features |>
+  group_by(dominant_type) |>
+  summarise(
+    stations_total = n(),
+    
+    stations_with_coordinates =
+      sum(!is.na(longitude) & !is.na(latitude)),
+    
+    stations_ready_for_kde =
+      sum(!is.na(longitude) & !is.na(latitude)),
+    
+    stations_modelling_eligible =
+      sum(modelling_eligible, na.rm = TRUE),
+    
+    mean_primary_valid_pct =
+      mean(primary_valid_pct, na.rm = TRUE),
+    
+    median_primary_valid_pct =
+      median(primary_valid_pct, na.rm = TRUE),
+    
+    mean_utilisation =
+      mean(mean_utilisation, na.rm = TRUE),
+    
+    median_utilisation =
+      median(mean_utilisation, na.rm = TRUE),
+    
+    .groups = "drop"
+  ) |>
+  mutate(
+    kde_supported = stations_ready_for_kde >= 1,
+    
+    gwr_warning = stations_modelling_eligible < 100,
+    
+    objective_1_note = case_when(
+      stations_ready_for_kde == stations_total ~
+        "Objective 1 supported. All stations in this group have coordinates for KDE/NCKDE.",
+      stations_ready_for_kde > 0 ~
+        "Objective 1 partly supported. Some stations are missing coordinates and should be excluded from KDE/NCKDE.",
+      TRUE ~
+        "Objective 1 not supported for this group because no valid coordinates are available."
+    ),
+    
+    objective_2_note = case_when(
+      stations_modelling_eligible >= 100 ~
+        "Objective 2 likely supported for separate GWR/GWML modelling.",
+      stations_modelling_eligible >= 50 ~
+        "Objective 2 may be feasible but local modelling could be unstable. Consider larger bandwidth or pooled modelling with charger-type interaction.",
+      stations_modelling_eligible > 0 ~
+        "Small sample for separate local modelling. Use only for descriptive checks or pooled model sensitivity.",
+      TRUE ~
+        "Objective 2 not supported for this group after cleaning."
+    )
+  )
+
+objective_support
+
+write_csv(
+  objective_support,
+  "data/processed/objective_support_by_dominant_type.csv"
+)
+
+# -----------------------------
+# Overall objective support
+# -----------------------------
+
+objective_support_overall <- station_features |>
+  summarise(
+    stations_total = n(),
+    
+    stations_with_coordinates =
+      sum(!is.na(longitude) & !is.na(latitude)),
+    
+    stations_ready_for_kde =
+      sum(!is.na(longitude) & !is.na(latitude)),
+    
+    stations_modelling_eligible =
+      sum(modelling_eligible, na.rm = TRUE),
+    
+    stations_low_coverage =
+      sum(low_coverage_flag, na.rm = TRUE),
+    
+    stations_high_full_occupancy =
+      sum(full_occ_pct > 0.05, na.rm = TRUE),
+    
+    mean_primary_valid_pct =
+      mean(primary_valid_pct, na.rm = TRUE),
+    
+    median_primary_valid_pct =
+      median(primary_valid_pct, na.rm = TRUE),
+    
+    mean_utilisation_network =
+      mean(mean_utilisation, na.rm = TRUE),
+    
+    median_utilisation_network =
+      median(mean_utilisation, na.rm = TRUE)
+  ) |>
+  mutate(
+    objective_1_supported =
+      stations_ready_for_kde >= 1600,
+    
+    objective_2_supported =
+      stations_modelling_eligible >= 1000,
+    
+    overall_note = case_when(
+      objective_1_supported & objective_2_supported ~
+        "Both objectives remain supported after cleaning. KDE/NCKDE can use all stations with valid coordinates, while GWR/GWML can use the modelling-eligible subset.",
+      objective_1_supported & !objective_2_supported ~
+        "Objective 1 remains supported, but Objective 2 may be affected by reduced modelling-eligible stations. Consider relaxed coverage thresholds or pooled modelling.",
+      !objective_1_supported & objective_2_supported ~
+        "Objective 2 remains supported, but Objective 1 is affected by missing spatial coordinates. Review station metadata.",
+      TRUE ~
+        "Both objectives require review before proceeding."
+    )
+  )
+
+objective_support_overall
+
+write_csv(
+  objective_support_overall,
+  "data/processed/objective_support_overall.csv"
+)
+
+# -----------------------------
+# Issue summary
+# -----------------------------
+
+issue_summary <- station_features |>
+  count(issue_log, name = "stations") |>
+  mutate(
+    pct_stations = stations / sum(stations)
+  ) |>
+  arrange(desc(stations))
+
+issue_summary
+
+write_csv(
+  issue_summary,
+  "data/processed/objective_support_issue_summary.csv"
+)
+
+# -----------------------------
+# Recommended modelling strategy
+# -----------------------------
+
+modelling_strategy <- objective_support |>
+  transmute(
+    dominant_type,
+    stations_total,
+    stations_modelling_eligible,
+    gwr_warning,
+    recommended_strategy = case_when(
+      stations_modelling_eligible >= 100 ~
+        "Proceed with separate charger-type model if POI covariates are also complete.",
+      stations_modelling_eligible >= 50 ~
+        "Proceed cautiously. Use larger adaptive bandwidth and compare against pooled model.",
+      stations_modelling_eligible > 0 ~
+        "Do not rely on separate GWR/GWML. Use pooled model with charger-type interaction or descriptive analysis.",
+      TRUE ~
+        "No modelling strategy available for this group."
+    )
+  )
+
+modelling_strategy
+
+write_csv(
+  modelling_strategy,
+  "data/processed/recommended_modelling_strategy.csv"
+)
+
+# -----------------------------
+# Final console summary
+# -----------------------------
+
+cat("\nObjective support check completed.\n")
+cat("Outputs saved in data/processed/:\n")
+cat("- objective_support_table_integrity_check.csv\n")
+cat("- objective_support_by_dominant_type.csv\n")
+cat("- objective_support_overall.csv\n")
+cat("- objective_support_issue_summary.csv\n")
+cat("- recommended_modelling_strategy.csv\n")
+```
+
+#### Rationale
+
+KDE and NCKDE are less threatened by row-level cleaning because they rely mainly on station locations and charger type. GWR and GWML are more sensitive because each station needs a reliable response variable and POI covariates.
+
+#### Decision and caveat
+
+Do not remove low-coverage stations from Objective 1. For Objective 2, use only modelling-eligible stations in the main model, but report sensitivity results with relaxed coverage thresholds if the fast-only subset becomes too small.
+
+### Summary
+
+|  |  |  |  |
+|------------------|-------------------|-------------------|------------------|
+| **Issue** | **Evidence to generate** | **Action taken** | **Rationale** |
+| Raw station assembly | File count, row count, schema check, metadata join completeness | Assemble all station CSVs into one long table | Required for reproducible station-level aggregation |
+| Null window | Network-wide all-state-null percentage and timestamp plot | Exclude from utilisation and temporal features | Likely system outage, not true zero demand |
+| Full-occupancy anomaly | Station-level full-occupancy rate distribution and threshold sensitivity | Flag stations above 5%; exclude flagged rows from primary utilisation | Avoid inflating demand while preserving sensitivity checks |
+| Duplicate timestamps | Count duplicate station-time keys | Remove or aggregate duplicates after inspection | Prevent double-counting readings |
+| Impossible values | Negative states, utilisation outside 0 to 1, pile mismatch | Exclude from primary feature computation | These values cannot represent valid occupancy |
+| Low station coverage | Station-level valid reading coverage | Flag below 70%; exclude from main GWR/GWML if needed | Low coverage weakens seasonal and temporal features |
+| Price anomalies | Negative prices or e_price \< s_price | Exclude from price-related features | Prevent false price-demand interpretation |
+| Fast/slow/mixed classification | Metadata-based station and pile composition | Use dominant type and retain mixed flag | Supports separate Objective 1 and Objective 2 analysis |
+| Station-level aggregation | Feature completeness and modelling eligibility | Produce one station-level feature table | Final Week 1 deliverable for spatial modelling |
